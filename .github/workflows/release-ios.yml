@@ -143,3 +143,4 @@ jobs:
           gh release create "$TAG" dist/Vantage.ipa dist/Vantage.ipa.sig \
             --repo "${{ github.repository }}" --title "Vantage ${{ inputs.version }} (iPhone)" \
             --notes "Unsigned iPhone build (source $SOURCE_SHA). Vantage Link on your PC signs and installs it for you." $flags
+
