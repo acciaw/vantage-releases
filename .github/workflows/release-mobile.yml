@@ -1,0 +1,265 @@
+name: Release the phone app
+
+# Builds the iPhone app (unsigned .ipa) and the Android app (.apk) from the private source repository, signs both
+# files with the release key, and publishes them here as ios-v<version> and android-v<version>. Vantage Link on each
+# user's PC installs the new build on their phone; Android phones can also install it from inside the app.
+#
+# Normally started by `npm run release` in the source repository, which picks the version and commit. By hand:
+#   gh workflow run release-mobile.yml -f version=1.2.0 -f publish=true
+# With publish off (the default) everything runs, but the results are DRAFT releases only collaborators can see.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release number, e.g. 1.2.0. Must equal "version" in app.json at that commit.'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag or commit of the source repository to build'
+        required: true
+        default: master
+        type: string
+      publish:
+        description: 'Publish for real (off: private draft releases)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-mobile
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: acciaw/valorant_app
+  VERSION: ${{ inputs.version }}
+  GH_TOKEN: ${{ github.token }}
+  # The EAS Update channel the builds listen to: the one `npm run release` publishes over-the-air updates to.
+  UPDATE_CHANNEL: preview
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - name: Check the version and that it isn't released yet
+        id: check
+        run: |
+          app="$(jq -r .expo.version src/app.json)"
+          if [ "$app" != "$VERSION" ]; then echo "::error::version $VERSION doesn't match app.json ($app)"; exit 1; fi
+          for tag in "ios-v$VERSION" "android-v$VERSION"; do
+            state="$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+            if [ "$state" = "false" ]; then echo "::error::$tag is already published; release a higher number instead"; exit 1; fi
+          done
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  ios:
+    needs: check
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm ci
+
+      # The runtime version over-the-air updates are matched on. Worked out before prebuild, from the same files
+      # `npm run release` looks at, and published with the build so the next release can compare against it.
+      - name: Record the runtime version
+        working-directory: src
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          npx expo-updates runtimeversion:resolve --platform ios | jq -r .runtimeVersion > "$RUNNER_TEMP/dist/runtime-version.txt"
+          echo "runtime version: $(cat "$RUNNER_TEMP/dist/runtime-version.txt")"
+
+      # Generates ios/ (git-ignored in the source repo; the project uses Continuous Native Generation).
+      - name: Prebuild
+        working-directory: src
+        env:
+          CI: '1'
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install pods
+        working-directory: src/ios
+        run: pod install
+
+      # A build made outside EAS Build has to name its update channel itself (EAS Build normally writes it from eas.json).
+      - name: Point the build at its update channel
+        working-directory: src
+        run: |
+          plist="$(find ios -name Expo.plist -not -path '*/Pods/*' | head -1)"
+          echo "Expo.plist: $plist"
+          /usr/libexec/PlistBuddy -c "Add :EXUpdatesRequestHeaders dict" "$plist" || true
+          /usr/libexec/PlistBuddy -c "Add :EXUpdatesRequestHeaders:expo-channel-name string $UPDATE_CHANNEL" "$plist" \
+            || /usr/libexec/PlistBuddy -c "Set :EXUpdatesRequestHeaders:expo-channel-name $UPDATE_CHANNEL" "$plist"
+          /usr/libexec/PlistBuddy -c "Print :EXUpdatesRequestHeaders" "$plist"
+
+      # Unsigned on purpose: Vantage Link signs it for each user's own iPhone.
+      - name: Archive
+        working-directory: src
+        run: |
+          set -o pipefail
+          workspace="$(ls -d ios/*.xcworkspace | head -1)"
+          scheme="$(basename "$workspace" .xcworkspace)"
+          xcodebuild archive \
+            -workspace "$workspace" -scheme "$scheme" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tail -n 80
+
+      - name: Package the IPA
+        run: |
+          app="$(ls -d "$RUNNER_TEMP"/App.xcarchive/Products/Applications/*.app | head -1)"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Info.plist"
+          # The runtime version the build embedded should be the one recorded above; if not, say so loudly, because
+          # over-the-air updates published from a PC would then never reach this build.
+          embedded="$(find "$app" -name app.manifest -exec jq -r '.runtimeVersion // empty' {} \; | head -1)"
+          if [ -n "$embedded" ] && [ "$embedded" != "$(cat "$RUNNER_TEMP/dist/runtime-version.txt")" ]; then
+            echo "::warning::the iOS build embedded runtime version $embedded, not $(cat "$RUNNER_TEMP/dist/runtime-version.txt")"
+          fi
+          mkdir -p "$RUNNER_TEMP/pkg/Payload"
+          cp -R "$app" "$RUNNER_TEMP/pkg/Payload/"
+          (cd "$RUNNER_TEMP/pkg" && zip -qry "$RUNNER_TEMP/dist/Vantage.ipa" Payload)
+          ls -la "$RUNNER_TEMP/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: ${{ runner.temp }}/dist
+          retention-days: 7
+
+  android:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        working-directory: src
+        run: npm ci
+
+      - name: Record the runtime version
+        working-directory: src
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          npx expo-updates runtimeversion:resolve --platform android | jq -r .runtimeVersion > "$RUNNER_TEMP/dist/runtime-version.txt"
+          echo "runtime version: $(cat "$RUNNER_TEMP/dist/runtime-version.txt")"
+
+      # Built here rather than in Expo's cloud, but with the signing key stored on Expo (EXPO_TOKEN), so every build
+      # is signed like the ones already on people's phones and installs over them, keeping their data. The "preview"
+      # profile in eas.json sets the update channel and gives each build a higher version code.
+      - name: Build the APK
+        working-directory: src
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then echo "::error::the EXPO_TOKEN secret isn't set on this repository"; exit 1; fi
+          npx eas-cli@latest build --platform android --profile preview --local --non-interactive --output "$RUNNER_TEMP/dist/Vantage.apk"
+
+      - name: Check the APK
+        run: |
+          aapt="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)"
+          badge="$("$aapt" dump badging "$RUNNER_TEMP/dist/Vantage.apk" | head -1)"
+          echo "$badge"
+          case "$badge" in
+            *"name='app.vantage.companion'"*"versionName='$VERSION'"*) ;;
+            *) echo "::error::the APK isn't app.vantage.companion $VERSION"; exit 1 ;;
+          esac
+          ls -la "$RUNNER_TEMP/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: ${{ runner.temp }}/dist
+          retention-days: 7
+
+  publish:
+    needs: [check, ios, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Build the signing tool
+        run: |
+          rustup update stable --no-self-update
+          cargo build --release --locked --manifest-path src/desktop/tools/vl-sign/Cargo.toml
+
+      - name: Sign
+        env:
+          VL_SIGNING_KEY: ${{ secrets.VL_SIGNING_KEY }}
+        run: |
+          sign=src/desktop/tools/vl-sign/target/release/vl-sign
+          for file in dist/ios/Vantage.ipa dist/android/Vantage.apk; do
+            "$sign" sign "$file"
+            # Stops here if the secret doesn't match desktop/release-key.pub: every copy of Vantage Link would refuse it.
+            "$sign" verify "$file" --key src/desktop/release-key.pub
+          done
+
+      - name: Release
+        run: |
+          flags="--draft"
+          if [ "${{ inputs.publish }}" = "true" ]; then flags=""; fi
+          sha="$(git -C src rev-parse --short HEAD)"
+          for tag in "ios-v$VERSION" "android-v$VERSION"; do
+            if [ "$(gh release view "$tag" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+              gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag
+            fi
+          done
+          gh release create "ios-v$VERSION" dist/ios/Vantage.ipa dist/ios/Vantage.ipa.sig dist/ios/runtime-version.txt \
+            --repo "${{ github.repository }}" --title "Vantage $VERSION (iPhone)" \
+            --notes "Unsigned iPhone build (source $sha). Vantage Link on your PC signs and installs it for you." $flags
+          gh release create "android-v$VERSION" dist/android/Vantage.apk dist/android/Vantage.apk.sig dist/android/runtime-version.txt \
+            --repo "${{ github.repository }}" --title "Vantage $VERSION (Android)" \
+            --notes "Android build (source $sha). Vantage Link on your PC installs it, and the app offers it to phones that already have Vantage." $flags
