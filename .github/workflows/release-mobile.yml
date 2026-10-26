@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # so a failed build can cancel the other one instead of leaving it to run for nothing
 
 concurrency:
   group: release-mobile
@@ -61,6 +62,29 @@ jobs:
             if [ "$state" = "false" ]; then echo "::error::$tag is already published; release a higher number instead"; exit 1; fi
           done
           echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      # The Android build is signed with the keystore stored on Expo, so EXPO_TOKEN has to be able to open the
+      # project. Checked here, before either build starts, so a wrong token costs a minute, not a half-hour Mac build.
+      - name: Check the Expo token can open the project
+        working-directory: src
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          set -o pipefail
+          if [ -z "$EXPO_TOKEN" ]; then echo "::error::the EXPO_TOKEN secret isn't set on this repository"; exit 1; fi
+          npm ci --ignore-scripts --no-audit --no-fund
+          if ! npx eas-cli@latest project:info --non-interactive; then
+            project="$(jq -r .expo.extra.eas.projectId app.json)"
+            who="$(npx eas-cli@latest whoami 2>&1 | grep -m1 . || true)"
+            echo "::error::EXPO_TOKEN can't open the Expo project $project (eas whoami: $who). Make a token on the Expo account that owns the project (on expo.dev, open the project: its address names the account; then that account's Settings → Access tokens) and save it as the EXPO_TOKEN secret of this repository."
+            exit 1
+          fi
 
   ios:
     needs: check
@@ -119,19 +143,29 @@ jobs:
             || /usr/libexec/PlistBuddy -c "Set :EXUpdatesRequestHeaders:expo-channel-name $UPDATE_CHANNEL" "$plist"
           /usr/libexec/PlistBuddy -c "Print :EXUpdatesRequestHeaders" "$plist"
 
-      # Unsigned on purpose: Vantage Link signs it for each user's own iPhone.
+      # Unsigned on purpose: Vantage Link signs it for each user's own iPhone. Takes 15-30 minutes; xcbeautify
+      # (on GitHub's macOS images) shows progress as it goes and marks errors, and the full log is kept for a failure.
       - name: Archive
         working-directory: src
         run: |
           set -o pipefail
           workspace="$(ls -d ios/*.xcworkspace | head -1)"
           scheme="$(basename "$workspace" .xcworkspace)"
+          if command -v xcbeautify >/dev/null; then show="xcbeautify --renderer github-actions"; else show="cat"; fi
           xcodebuild archive \
             -workspace "$workspace" -scheme "$scheme" -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            | tail -n 80
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | $show
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package the IPA
         run: |
@@ -153,6 +187,11 @@ jobs:
           name: ios
           path: ${{ runner.temp }}/dist
           retention-days: 7
+
+      # Both platforms are released together, so there's no point finishing the Android build.
+      - name: Stop the Android build
+        if: failure()
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}" || true
 
   android:
     needs: check
@@ -215,6 +254,11 @@ jobs:
           name: android
           path: ${{ runner.temp }}/dist
           retention-days: 7
+
+      # Both platforms are released together, so there's no point finishing the (slower, pricier) iPhone build.
+      - name: Stop the iPhone build
+        if: failure()
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}" || true
 
   publish:
     needs: [check, ios, android]
