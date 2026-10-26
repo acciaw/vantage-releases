@@ -1,0 +1,105 @@
+name: Release Vantage Link (Windows)
+
+# Builds Vantage Link from the private source repository, signs it with the release key and publishes it here.
+# Run it from the Actions tab, or: gh workflow run release-desktop.yml -f version=0.2.0 -f publish=true
+#
+# With publish off (the default) everything runs, but the result is a DRAFT release that only collaborators can
+# see, so a build can be checked before anything is public.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.2.0. Must equal the version in desktop/Cargo.toml.'
+        required: true
+        type: string
+      ref:
+        description: 'Branch, tag or commit of the source repository to build'
+        required: true
+        default: master
+        type: string
+      publish:
+        description: 'Publish for real (off: a private draft release)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: acciaw/valorant_app
+  TAG: desktop-v${{ inputs.version }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The source is private. A read-only deploy key on that repository (stored as a secret here) lets this job read it.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - name: Check the version
+        run: |
+          crate="$(grep -m1 '^version' src/desktop/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "${{ inputs.version }}" != "$crate" ]; then
+            echo "::error::version ${{ inputs.version }} doesn't match desktop/Cargo.toml ($crate)"; exit 1
+          fi
+          # A published version is immutable: installed copies trust it by number.
+          state="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>/dev/null || echo none)"
+          if [ "$state" = "false" ]; then echo "::error::$TAG is already published; release a higher version instead"; exit 1; fi
+          if [ "$state" = "true" ]; then gh release delete "$TAG" --repo "${{ github.repository }}" --yes; fi
+          echo "SOURCE_SHA=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src/desktop
+            src/desktop/tools/vl-sign
+
+      - name: Test
+        working-directory: src/desktop
+        run: cargo test --locked
+
+      # "dist" is what makes the exe install itself and start with Windows on first run.
+      - name: Build
+        working-directory: src/desktop
+        run: |
+          cargo build --release --locked --features dist
+          cargo build --release --locked --manifest-path tools/vl-sign/Cargo.toml
+
+      - name: Sign
+        working-directory: src/desktop
+        env:
+          VL_SIGNING_KEY: ${{ secrets.VL_SIGNING_KEY }}
+        run: |
+          mkdir -p dist
+          cp target/release/vantage-link.exe dist/vantage-link.exe
+          ./tools/vl-sign/target/release/vl-sign.exe sign dist/vantage-link.exe
+          # Stops the build if the secret doesn't match desktop/release-key.pub, which would produce an update that
+          # every installed copy rejects.
+          ./tools/vl-sign/target/release/vl-sign.exe verify dist/vantage-link.exe
+          ./dist/vantage-link.exe --version
+
+      - name: Release
+        working-directory: src/desktop
+        run: |
+          flags="--draft"
+          if [ "${{ inputs.publish }}" = "true" ]; then flags=""; fi
+          gh release create "$TAG" dist/vantage-link.exe dist/vantage-link.exe.sig \
+            --repo "${{ github.repository }}" --title "Vantage Link ${{ inputs.version }}" \
+            --notes "Vantage Link ${{ inputs.version }} for Windows (source $SOURCE_SHA)." $flags
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            # A fixed address for the website: .../releases/download/desktop-latest/vantage-link.exe
+            # It is a prerelease, so the app's own update check ignores it.
+            gh release delete desktop-latest --repo "${{ github.repository }}" --yes --cleanup-tag || true
+            gh release create desktop-latest dist/vantage-link.exe dist/vantage-link.exe.sig \
+              --repo "${{ github.repository }}" --prerelease --title "Vantage Link (latest)" \
+              --notes "The newest Windows build (${{ inputs.version }}). This is the download link for the website."
+          fi
