@@ -1,0 +1,109 @@
+name: Release chat certificate
+
+# Issues and renews the Let's Encrypt certificate Vantage Link serves to the Riot Client for chat (the Riot
+# Client only trusts publicly-trusted certificates since April 2026). The certificate is for a name
+# (localhost.accw.dev) that resolves to the user's own machine, so Vantage Link ships the private key; see
+# desktop/docs/chat-cert.md in the source repository for the full design and the one-time acme-dns/DNS setup.
+#
+# Normally runs on its own schedule. By hand: gh workflow run release-chat-cert.yml -f force=true
+on:
+  schedule:
+    - cron: "17 3 * * 1,4" # twice a week; acme.sh only reissues when it's within 30 days of expiry
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Reissue even if the current certificate isn't near expiry"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-chat-cert
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: acciaw/valorant_app
+  CHAT_HOST: localhost.accw.dev
+  TAG: chat-cert-latest
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The source is private. A read-only deploy key on that repository (stored as a secret here) lets this job
+      # read it, for vl-sign — the same tool and key the other releases are signed with.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/desktop/tools/vl-sign
+
+      - name: Build vl-sign
+        run: cargo build --release --locked --manifest-path src/desktop/tools/vl-sign/Cargo.toml
+
+      - name: Install acme.sh
+        run: curl -s https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --no-cron --accountemail "${{ secrets.ACME_EMAIL }}"
+
+      - name: Issue or renew the certificate (DNS-01 via acme-dns)
+        id: issue
+        env:
+          ACMEDNS_BASE_URL: ${{ secrets.ACMEDNS_BASE_URL }}
+          ACMEDNS_USERNAME: ${{ secrets.ACMEDNS_USERNAME }}
+          ACMEDNS_PASSWORD: ${{ secrets.ACMEDNS_PASSWORD }}
+          ACMEDNS_SUBDOMAIN: ${{ secrets.ACMEDNS_SUBDOMAIN }}
+        run: |
+          set -euo pipefail
+          ACME=~/.acme.sh/acme.sh
+          FORCE=""
+          [ "${{ inputs.force }}" = "true" ] && FORCE="--force"
+          # acme.sh writes the acme-dns TXT record via its API; Let's Encrypt follows the CNAME delegation to
+          # verify it. Exit code 2 from acme.sh means "not due yet" — not an error.
+          if ! "$ACME" --issue --dns dns_acmedns -d "$CHAT_HOST" --server letsencrypt --keylength ec-256 $FORCE; then
+            code=$?
+            if [ "$code" = 2 ]; then
+              echo "nothing to renew yet"
+              echo "skip=1" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            exit "$code"
+          fi
+          DIR=~/.acme.sh/${CHAT_HOST}_ecc
+          cp "$DIR/fullchain.cer" fullchain.pem
+          cp "$DIR/${CHAT_HOST}.key" privkey.pem
+          echo "skip=0" >>"$GITHUB_OUTPUT"
+
+      - name: Build and sign the bundle
+        if: steps.issue.outputs.skip != '1'
+        env:
+          VL_SIGNING_KEY: ${{ secrets.VL_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          NOT_AFTER=$(date -d "$(openssl x509 -enddate -noout -in fullchain.pem | cut -d= -f2)" +%s)
+          # The bundle Vantage Link reads: desktop/src/riot/chat_cert.rs. --rawfile keeps the PEM newlines intact.
+          jq -n --arg host "$CHAT_HOST" --rawfile pem fullchain.pem --rawfile key privkey.pem --argjson notAfter "$NOT_AFTER" \
+            '{host: $host, pem: $pem, key: $key, notAfter: $notAfter}' > chat-cert.json
+          src/desktop/tools/vl-sign/target/release/vl-sign sign chat-cert.json
+          # Stops the build if the secret doesn't match desktop/release-key.pub, which would ship a certificate
+          # every installed copy rejects.
+          src/desktop/tools/vl-sign/target/release/vl-sign verify chat-cert.json
+
+      - name: Publish
+        if: steps.issue.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          # A rolling prerelease (prerelease, so nothing else treats it as a normal version-ordered release):
+          # delete and recreate, the way desktop-latest and android-latest work.
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          gh release create "$TAG" chat-cert.json chat-cert.json.sig \
+            --repo "${{ github.repository }}" --prerelease --title "Chat certificate" \
+            --notes "Current Vantage Link chat proxy certificate for $CHAT_HOST. Rotated automatically; not a normal download."
